@@ -50,4 +50,4 @@ jobs:
           TWINE_REPOSITORY_URL: https://pypi.bookdisco.space/
           TWINE_USERNAME: pypi
           TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-        run: twine upload dist/*
+        run: twine upload --skip-existing dist/*
