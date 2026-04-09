@@ -11,7 +11,7 @@ from typing import Tuple, Dict
 from yapic import json
 
 from cryptofeed.connection import AsyncConnection, HTTPPoll, RestEndpoint, Routes, WebsocketEndpoint
-from cryptofeed.defines import BALANCES, BINANCE_FUTURES, BUY, FUNDING, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, POSITIONS, SELL
+from cryptofeed.defines import BALANCES, BINANCE_FUTURES, BUY, CANDLES, FUNDING, L2_BOOK, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, POSITIONS, SELL, TICKER
 from cryptofeed.exchanges.binance import Binance
 from cryptofeed.exchanges.mixins.binance_rest import BinanceFuturesRestMixin
 from cryptofeed.types import Balance, OpenInterest, OrderInfo, Position
@@ -52,6 +52,87 @@ class BinanceFutures(Binance, BinanceFuturesRestMixin):
         """
         super().__init__(**kwargs)
         self.open_interest_interval = open_interest_interval
+
+    def _address(self):
+        """
+        Override to route streams to categorized WebSocket endpoints per Binance
+        USDⓈ-M Futures upgrade (legacy endpoints retired 2026-04-23):
+        - /public: high-frequency data (depth, aggTrade)
+        - /market: regular data (bookTicker, markPrice, kline, forceOrder)
+        - /private: user data streams
+        Sandbox retains old URL format.
+        """
+        base = self.address
+
+        if self.requires_authentication:
+            listen_key = self._generate_token()
+            if self.sandbox:
+                return base + '/ws/' + listen_key
+            return base + '/private/ws/' + listen_key
+
+        is_any_private = any(self.is_authenticated_channel(chan) for chan in self.subscription)
+        is_any_public = any(not self.is_authenticated_channel(chan) for chan in self.subscription)
+        if is_any_private and is_any_public:
+            raise ValueError("Private channels should be subscribed in separate feeds vs public channels")
+        if all(self.is_authenticated_channel(chan) for chan in self.subscription):
+            if self.sandbox:
+                return base + '/ws/'
+            return base + '/private/ws/'
+
+        public_subs = []   # depth, bookTicker (high-frequency order book data)
+        market_subs = []   # aggTrade, markPrice, kline, forceOrder (regular market data)
+
+        for chan in self.subscription:
+            normalized_chan = self.exchange_channel_to_std(chan)
+            if normalized_chan == OPEN_INTEREST:
+                continue
+            if self.is_authenticated_channel(normalized_chan):
+                continue
+
+            stream = chan
+            if normalized_chan == CANDLES:
+                stream = f"{chan}{self.candle_interval}"
+            elif normalized_chan == L2_BOOK:
+                stream = f"{chan}@{self.depth_interval}"
+
+            for pair in self.subscription[chan]:
+                if pair.startswith("p"):
+                    if normalized_chan != CANDLES:
+                        raise ValueError("Premium Index Symbols only allowed on Candle data feed")
+                else:
+                    pair = pair.lower()
+
+                sub_str = f"{pair}@{stream}"
+                if normalized_chan in (L2_BOOK, TICKER):
+                    public_subs.append(sub_str)
+                else:
+                    market_subs.append(sub_str)
+
+        # Sandbox: keep old single-path format
+        if self.sandbox:
+            all_subs = public_subs + market_subs
+            if 0 < len(all_subs) < self.per_connection_limit:
+                return base + '/stream?streams=' + '/'.join(all_subs)
+            if all_subs:
+                return [base + '/stream?streams=' + '/'.join(all_subs[i:i + self.per_connection_limit])
+                        for i in range(0, len(all_subs), self.per_connection_limit)]
+            return base + '/stream?streams='
+
+        # Production: split into /public and /market paths
+        def _build_urls(path, subs):
+            if not subs:
+                return []
+            prefix = base + path + '/stream?streams='
+            if len(subs) <= self.per_connection_limit:
+                return [prefix + '/'.join(subs)]
+            return [prefix + '/'.join(subs[i:i + self.per_connection_limit])
+                    for i in range(0, len(subs), self.per_connection_limit)]
+
+        addrs = _build_urls('/public', public_subs) + _build_urls('/market', market_subs)
+
+        if not addrs:
+            return base + '/public/stream?streams='
+        return addrs[0] if len(addrs) == 1 else addrs
 
     def _connect_rest(self):
         ret = []
