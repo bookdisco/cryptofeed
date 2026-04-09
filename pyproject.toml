@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cryptofeed"
-version = "2.4.1"
+version = "2.4.2"
 description = "Cryptocurrency Exchange Websocket Data Feed Handler"
 readme = "README.md"
 license = "XFree86-1.1"
