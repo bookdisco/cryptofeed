@@ -11,7 +11,7 @@ from typing import Tuple, Dict
 from yapic import json
 
 from cryptofeed.connection import AsyncConnection, HTTPPoll, RestEndpoint, Routes, WebsocketEndpoint
-from cryptofeed.defines import BALANCES, BINANCE_FUTURES, BUY, CANDLES, FUNDING, L2_BOOK, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, POSITIONS, SELL, TICKER, TRADES
+from cryptofeed.defines import BALANCES, BINANCE_FUTURES, BUY, CANDLES, FUNDING, L2_BOOK, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, POSITIONS, SELL, TICKER
 from cryptofeed.exchanges.binance import Binance
 from cryptofeed.exchanges.mixins.binance_rest import BinanceFuturesRestMixin
 from cryptofeed.types import Balance, OpenInterest, OrderInfo, Position
