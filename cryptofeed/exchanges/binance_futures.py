@@ -11,7 +11,7 @@ from typing import Tuple, Dict
 from yapic import json
 
 from cryptofeed.connection import AsyncConnection, HTTPPoll, RestEndpoint, Routes, WebsocketEndpoint
-from cryptofeed.defines import BALANCES, BINANCE_FUTURES, BUY, CANDLES, FUNDING, L2_BOOK, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, PERPETUAL, POSITIONS, SELL, TICKER
+from cryptofeed.defines import BALANCES, BINANCE_FUTURES, BUY, CANDLES, FUNDING, L2_BOOK, L2_BOOK_RPI, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, PERPETUAL, POSITIONS, SELL, TICKER
 from cryptofeed.exchanges.binance import Binance
 from cryptofeed.exchanges.mixins.binance_rest import BinanceFuturesRestMixin
 from cryptofeed.types import Balance, OpenInterest, OrderInfo, Position
@@ -22,13 +22,14 @@ LOG = logging.getLogger('feedhandler')
 class BinanceFutures(Binance, BinanceFuturesRestMixin):
     id = BINANCE_FUTURES
     websocket_endpoints = [WebsocketEndpoint('wss://fstream.binance.com', sandbox='wss://stream.binancefuture.com', options={'compression': None})]
-    rest_endpoints = [RestEndpoint('https://fapi.binance.com', sandbox='https://testnet.binancefuture.com', routes=Routes('/fapi/v1/exchangeInfo', l2book='/fapi/v1/depth?symbol={}&limit={}', authentication='/fapi/v1/listenKey', open_interest='/fapi/v1/openInterest?symbol={}'))]
+    rest_endpoints = [RestEndpoint('https://fapi.binance.com', sandbox='https://testnet.binancefuture.com', routes=Routes('/fapi/v1/exchangeInfo', l2book='/fapi/v1/depth?symbol={}&limit={}', l2book_rpi='/fapi/v1/rpiDepth?symbol={}&limit={}', authentication='/fapi/v1/listenKey', open_interest='/fapi/v1/openInterest?symbol={}'))]
 
     valid_depths = [5, 10, 20, 50, 100, 500, 1000]
     valid_depth_intervals = {'100ms', '250ms', '500ms'}
     websocket_channels = {
         **Binance.websocket_channels,
         FUNDING: 'markPrice',
+        L2_BOOK_RPI: 'rpiDepth',
         OPEN_INTEREST: 'open_interest',
         LIQUIDATIONS: 'forceOrder',
         POSITIONS: POSITIONS
@@ -96,6 +97,8 @@ class BinanceFutures(Binance, BinanceFuturesRestMixin):
                 stream = f"{chan}{self.candle_interval}"
             elif normalized_chan == L2_BOOK:
                 stream = f"{chan}@{self.depth_interval}"
+            elif normalized_chan == L2_BOOK_RPI:
+                stream = f"{chan}@500ms"
 
             for pair in self.subscription[chan]:
                 if pair.startswith("p"):
@@ -105,7 +108,7 @@ class BinanceFutures(Binance, BinanceFuturesRestMixin):
                     pair = pair.lower()
 
                 sub_str = f"{pair}@{stream}"
-                if normalized_chan in (L2_BOOK, TICKER):
+                if normalized_chan in (L2_BOOK, L2_BOOK_RPI, TICKER):
                     public_subs.append(sub_str)
                 else:
                     market_subs.append(sub_str)
@@ -334,7 +337,7 @@ class BinanceFutures(Binance, BinanceFuturesRestMixin):
 
         # Combined stream events are wrapped as follows: {"stream":"<streamName>","data":<rawPayload>}
         # streamName is of format <symbol>@<channel>
-        pair, _ = msg['stream'].split('@', 1)
+        pair, stream = msg['stream'].split('@', 1)
         msg = msg['data']
 
         pair = pair.upper()
@@ -343,7 +346,8 @@ class BinanceFutures(Binance, BinanceFuturesRestMixin):
         if msg_type == 'bookTicker':
             await self._ticker(msg, timestamp)
         elif msg_type == 'depthUpdate':
-            await self._book(msg, pair, timestamp)
+            book_type = L2_BOOK_RPI if stream.startswith('rpiDepth') else L2_BOOK
+            await self._book(msg, pair, timestamp, book_type=book_type)
         elif msg_type == 'aggTrade':
             await self._trade(msg, timestamp)
         elif msg_type == 'forceOrder':

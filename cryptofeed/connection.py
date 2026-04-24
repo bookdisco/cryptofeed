@@ -402,6 +402,7 @@ class Routes:
     stats: str = None
     authentication: str = None
     l2book: str = None
+    l2book_rpi: str = None
     l3book: str = None
 
 

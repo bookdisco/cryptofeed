@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 from yapic import json
 
 from cryptofeed.connection import AsyncConnection, HTTPPoll, HTTPConcurrentPoll, RestEndpoint, Routes, WebsocketEndpoint
-from cryptofeed.defines import ASK, BALANCES, BID, BINANCE, BUY, CANDLES, FUNDING, FUTURES, L2_BOOK, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, PERPETUAL, SELL, SPOT, TICKER, TRADES, FILLED, UNFILLED
+from cryptofeed.defines import ASK, BALANCES, BID, BINANCE, BUY, CANDLES, FUNDING, FUTURES, L2_BOOK, L2_BOOK_RPI, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, PERPETUAL, SELL, SPOT, TICKER, TRADES, FILLED, UNFILLED
 from cryptofeed.feed import Feed
 from cryptofeed.symbols import Symbol
 from cryptofeed.exchanges.mixins.binance_rest import BinanceRestMixin
@@ -251,6 +251,9 @@ class Binance(Feed, BinanceRestMixin):
                           raw=msg)
         await self.callback(LIQUIDATIONS, liq, receipt_timestamp=timestamp)
 
+    def _book_state_key(self, book_type: str, std_pair: str) -> str:
+        return std_pair if book_type == L2_BOOK else f"{book_type}:{std_pair}"
+
     def _check_update_id(self, std_pair: str, msg: dict) -> bool:
         """
         Messages will be queued while fetching snapshot and we can return a book_callback
@@ -272,7 +275,7 @@ class Binance(Feed, BinanceRestMixin):
             LOG.warning("%s: Missing book update detected, resetting book", self.id)
             return True
 
-    async def _snapshot(self, pair: str) -> None:
+    async def _snapshot(self, pair: str, book_type: str = L2_BOOK) -> None:
         max_depth = self.max_depth if self.max_depth else 1000
         if max_depth not in self.valid_depths:
             for d in self.valid_depths:
@@ -280,16 +283,19 @@ class Binance(Feed, BinanceRestMixin):
                     max_depth = d
                     break
 
-        resp = await self.http_conn.read(self.rest_endpoints[0].route('l2book', self.sandbox).format(pair, max_depth))
+        route = 'l2book_rpi' if book_type == L2_BOOK_RPI else 'l2book'
+        request_depth = 1000 if book_type == L2_BOOK_RPI else max_depth
+        resp = await self.http_conn.read(self.rest_endpoints[0].route(route, self.sandbox).format(pair, request_depth))
         resp = json.loads(resp, parse_float=Decimal)
         timestamp = self.timestamp_normalize(resp['E']) if 'E' in resp else None
 
         std_pair = self.exchange_symbol_to_std_symbol(pair)
-        self.last_update_id[std_pair] = resp['lastUpdateId']
-        self._l2_book[std_pair] = OrderBook(self.id, std_pair, max_depth=self.max_depth, bids={Decimal(u[0]): Decimal(u[1]) for u in resp['bids']}, asks={Decimal(u[0]): Decimal(u[1]) for u in resp['asks']})
-        await self.book_callback(L2_BOOK, self._l2_book[std_pair], time.time(), timestamp=timestamp, raw=resp, sequence_number=self.last_update_id[std_pair])
+        book_key = self._book_state_key(book_type, std_pair)
+        self.last_update_id[book_key] = resp['lastUpdateId']
+        self._l2_book[book_key] = OrderBook(self.id, std_pair, max_depth=self.max_depth, bids={Decimal(u[0]): Decimal(u[1]) for u in resp['bids']}, asks={Decimal(u[0]): Decimal(u[1]) for u in resp['asks']})
+        await self.book_callback(book_type, self._l2_book[book_key], time.time(), timestamp=timestamp, raw=resp, sequence_number=self.last_update_id[book_key])
 
-    async def _book(self, msg: dict, pair: str, timestamp: float):
+    async def _book(self, msg: dict, pair: str, timestamp: float, book_type: str = L2_BOOK):
         """
         {
             "e": "depthUpdate", // Event type
@@ -313,11 +319,12 @@ class Binance(Feed, BinanceRestMixin):
         """
         exchange_pair = pair
         pair = self.exchange_symbol_to_std_symbol(pair)
+        book_key = self._book_state_key(book_type, pair)
 
-        if pair not in self._l2_book:
-            await self._snapshot(exchange_pair)
+        if book_key not in self._l2_book:
+            await self._snapshot(exchange_pair, book_type=book_type)
 
-        skip_update = self._check_update_id(pair, msg)
+        skip_update = self._check_update_id(book_key, msg)
         if skip_update:
             return
 
@@ -330,12 +337,12 @@ class Binance(Feed, BinanceRestMixin):
                 delta[side].append((price, amount))
 
                 if amount == 0:
-                    if price in self._l2_book[pair].book[side]:
-                        del self._l2_book[pair].book[side][price]
+                    if price in self._l2_book[book_key].book[side]:
+                        del self._l2_book[book_key].book[side][price]
                 else:
-                    self._l2_book[pair].book[side][price] = amount
+                    self._l2_book[book_key].book[side][price] = amount
 
-        await self.book_callback(L2_BOOK, self._l2_book[pair], timestamp, timestamp=self.timestamp_normalize(msg['E']), raw=msg, delta=delta, sequence_number=self.last_update_id[pair])
+        await self.book_callback(book_type, self._l2_book[book_key], timestamp, timestamp=self.timestamp_normalize(msg['E']), raw=msg, delta=delta, sequence_number=self.last_update_id[book_key])
 
     async def _funding(self, msg: dict, timestamp: float):
         """
