@@ -11,7 +11,7 @@ from typing import Tuple, Dict
 from yapic import json
 
 from cryptofeed.connection import AsyncConnection, HTTPPoll, RestEndpoint, Routes, WebsocketEndpoint
-from cryptofeed.defines import BALANCES, BINANCE_FUTURES, BUY, CANDLES, FUNDING, L2_BOOK, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, POSITIONS, SELL, TICKER
+from cryptofeed.defines import BALANCES, BINANCE_FUTURES, BUY, CANDLES, FUNDING, L2_BOOK, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, PERPETUAL, POSITIONS, SELL, TICKER
 from cryptofeed.exchanges.binance import Binance
 from cryptofeed.exchanges.mixins.binance_rest import BinanceFuturesRestMixin
 from cryptofeed.types import Balance, OpenInterest, OrderInfo, Position
@@ -40,6 +40,8 @@ class BinanceFutures(Binance, BinanceFuturesRestMixin):
         add = {}
         for symbol, orig in base.items():
             if "_" in orig:
+                continue
+            if info['instrument_type'].get(symbol) != PERPETUAL:
                 continue
             add[f"{symbol.replace('PERP', 'PINDEX')}"] = f"p{orig}"
         base.update(add)
