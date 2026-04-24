@@ -55,6 +55,7 @@ UPBIT = 'UPBIT'
 # Market Data
 L1_BOOK = 'l1_book'
 L2_BOOK = 'l2_book'
+L2_BOOK_RPI = 'l2_book_rpi'
 L3_BOOK = 'l3_book'
 TRADES = 'trades'
 TICKER = 'ticker'
