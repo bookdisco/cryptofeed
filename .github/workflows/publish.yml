@@ -30,24 +30,41 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test]
     if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install build tools
         run: pip install build twine cython
 
-      - name: Build package
-        run: python -m build
+      - name: Build wheel
+        run: python -m build --wheel
+
+      - name: Add wheel build tag
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          for wheel in Path("dist").glob("cryptofeed-*.whl"):
+              parts = wheel.name.split("-")
+              if not parts[2][0].isdigit():
+                  parts.insert(2, "1")
+              renamed = wheel.with_name("-".join(parts))
+              wheel.rename(renamed)
+              print(f"{wheel.name} -> {renamed.name}")
+          PY
 
       - name: Publish to private PyPI
         env:
           TWINE_REPOSITORY_URL: https://pypi.bookdisco.space/
           TWINE_USERNAME: pypi
           TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-        run: twine upload dist/*
+        run: twine upload dist/*.whl
