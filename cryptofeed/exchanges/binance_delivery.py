@@ -21,6 +21,7 @@ LOG = logging.getLogger('feedhandler')
 
 class BinanceDelivery(Binance, BinanceDeliveryRestMixin):
     id = BINANCE_DELIVERY
+    ws_control_message_rate = 10
 
     # https://binance-docs.github.io/apidocs/delivery/en/#testnet
     websocket_endpoints = [WebsocketEndpoint('wss://dstream.binance.com', options={'compression': None}, sandbox='wss://dstream.binancefuture.com')]

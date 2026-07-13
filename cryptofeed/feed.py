@@ -65,6 +65,8 @@ class Feed(Exchange):
         self.retries = retries
         self.exceptions = exceptions
         self.connection_handlers = []
+        self._loop = None
+        self._running = False
         self.timeout = timeout
         self.timeout_interval = timeout_interval
         self.subscription = defaultdict(set)
@@ -266,6 +268,24 @@ class Feed(Exchange):
     async def authenticate(self, connection: AsyncConnection):
         pass
 
+    async def add_symbols(self, symbols):
+        """
+        Add symbols to a running feed.
+
+        Exchanges that support runtime subscriptions must override this method.
+        Calls must run on the same event loop that started the feed.
+        """
+        raise NotImplementedError(f'{self.id} does not support runtime symbol subscriptions')
+
+    async def remove_symbols(self, symbols):
+        """
+        Remove symbols from a running feed.
+
+        Exchanges that support runtime subscriptions must override this method.
+        Calls must run on the same event loop that started the feed.
+        """
+        raise NotImplementedError(f'{self.id} does not support runtime symbol subscriptions')
+
     async def shutdown(self):
         LOG.info('%s: feed shutdown starting...', self.id)
         await self.http_conn.close()
@@ -280,6 +300,7 @@ class Feed(Exchange):
         LOG.info('%s: feed shutdown completed', self.id)
 
     def stop(self):
+        self._running = False
         for c in self.connection_handlers:
             c.running = False
 
@@ -287,9 +308,10 @@ class Feed(Exchange):
         """
         Create tasks for exchange interfaces and backends
         """
+        self._loop = loop
+        self._running = True
         for conn, sub, handler, auth in self.connect():
-            self.connection_handlers.append(ConnectionHandler(conn, sub, handler, auth, self.retries, timeout=self.timeout, timeout_interval=self.timeout_interval, exceptions=self.exceptions, log_on_error=self.log_on_error, start_delay=self.start_delay))
-            self.connection_handlers[-1].start(loop)
+            self._start_connection(conn, sub, handler, auth, loop)
 
         for callbacks in self.callbacks.values():
             for callback in callbacks:
@@ -297,6 +319,14 @@ class Feed(Exchange):
                     LOG.info('%s: starting backend task %s with multiprocessing=%s', self.id, self.backend_name(callback), 'True' if self.config.backend_multiprocessing else 'False')
                     # Backends start tasks to write messages
                     callback.start(loop, multiprocess=self.config.backend_multiprocessing)
+
+    def _start_connection(self, conn, subscribe, handler, authenticate, loop):
+        """Register a connection with the feed's normal reconnect/watchdog lifecycle."""
+        control_handler = getattr(self, 'control_message_handler', None) if isinstance(conn, WSAsyncConn) else None
+        connection_handler = ConnectionHandler(conn, subscribe, handler, authenticate, self.retries, timeout=self.timeout, timeout_interval=self.timeout_interval, exceptions=self.exceptions, log_on_error=self.log_on_error, start_delay=self.start_delay, control_handler=control_handler)
+        self.connection_handlers.append(connection_handler)
+        connection_handler.start(loop)
+        return connection_handler
 
     def backend_name(self, callback):
         if hasattr(callback, '__class__'):

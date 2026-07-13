@@ -307,6 +307,33 @@ class WSAsyncConn(AsyncConnection):
         self.ws_kwargs = kwargs
 
     @property
+    def streams(self) -> List[str]:
+        """Return combined-stream names baked into this connection's URL."""
+        _, separator, streams = self.address.partition('streams=')
+        if not separator or not streams:
+            return []
+        return streams.split('/')
+
+    @property
+    def stream_address_prefix(self) -> str:
+        """Return the URL prefix that identifies a Binance stream path bucket."""
+        prefix, separator, _ = self.address.partition('streams=')
+        return prefix if separator else self.address
+
+    def set_streams(self, streams: List[str]):
+        """
+        Persist a combined-stream registry in the URL used by reconnects.
+
+        Binance connections are re-opened by this same object after a disconnect.
+        Keeping the authoritative stream list in ``address`` therefore makes runtime
+        subscription changes survive the exchange's mandatory reconnects.
+        """
+        prefix, separator, _ = self.address.partition('streams=')
+        if not separator:
+            raise ValueError(f'Connection address does not contain a stream registry: {self.address!r}')
+        self.address = prefix + 'streams=' + '/'.join(dict.fromkeys(streams))
+
+    @property
     def is_open(self) -> bool:
         return self.conn and not self.conn.state == State.CLOSED
 

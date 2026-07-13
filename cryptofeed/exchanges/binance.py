@@ -4,21 +4,23 @@ Copyright (C) 2017-2025 Bryant Moscon - bmoscon@gmail.com
 Please see the LICENSE file for the terms and conditions
 associated with this software.
 '''
+import asyncio
 import logging
 from asyncio import create_task, sleep
 from collections import defaultdict
 from decimal import Decimal
 import requests
 import time
-from typing import Dict, Union, Tuple
+from typing import Dict, List, Union, Tuple
 from urllib.parse import urlencode
 
 from yapic import json
 
-from cryptofeed.connection import AsyncConnection, HTTPPoll, HTTPConcurrentPoll, RestEndpoint, Routes, WebsocketEndpoint
+from cryptofeed.connection import AsyncConnection, HTTPPoll, HTTPConcurrentPoll, RestEndpoint, Routes, WebsocketEndpoint, WSAsyncConn
 from cryptofeed.defines import ASK, BALANCES, BID, BINANCE, BUY, CANDLES, FUNDING, FUTURES, L2_BOOK, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, PERPETUAL, SELL, SPOT, TICKER, TRADES, FILLED, UNFILLED
 from cryptofeed.feed import Feed
-from cryptofeed.symbols import Symbol
+from cryptofeed.exceptions import UnsupportedSymbol
+from cryptofeed.symbols import Symbol, Symbols
 from cryptofeed.exchanges.mixins.binance_rest import BinanceRestMixin
 from cryptofeed.types import Trade, Ticker, Candle, Liquidation, Funding, OrderBook, OrderInfo, Balance
 
@@ -46,6 +48,7 @@ class Binance(Feed, BinanceRestMixin):
     }
     request_limit = 20
     per_connection_limit = 1024
+    ws_control_message_rate = 5
 
     @classmethod
     def timestamp_normalize(cls, ts: float) -> float:
@@ -75,16 +78,27 @@ class Binance(Feed, BinanceRestMixin):
             info['instrument_type'][s.normalized] = stype
         return ret, info
 
-    def __init__(self, depth_interval='100ms', **kwargs):
+    def __init__(self, depth_interval='100ms', subscription_headroom=24, **kwargs):
         """
         depth_interval: str
             time between l2_book/delta updates {'100ms', '1000ms'} (different from BINANCE_FUTURES & BINANCE_DELIVERY)
+        subscription_headroom: int
+            stream slots reserved on each connection for operational headroom
         """
         if depth_interval is not None and depth_interval not in self.valid_depth_intervals:
             raise ValueError(f"Depth interval must be one of {self.valid_depth_intervals}")
+        if subscription_headroom < 0 or subscription_headroom >= self.per_connection_limit:
+            raise ValueError("subscription_headroom must be between 0 and per_connection_limit")
 
         super().__init__(**kwargs)
         self.depth_interval = depth_interval
+        self.subscription_headroom = subscription_headroom
+        self._dynamic_subscription_lock = asyncio.Lock()
+        self._control_message_lock = asyncio.Lock()
+        self._last_control_message = 0.0
+        self._control_message_id = 0
+        self._pending_control_messages = {}
+        self._control_ack_timeout = 10.0
         self._open_interest_cache = {}
         self._reset()
 
@@ -144,6 +158,349 @@ class Binance(Feed, BinanceRestMixin):
                     yield _list[i:i + n]
 
             return [address + '/'.join(chunk) for chunk in split_list(subs, self.per_connection_limit)]
+
+    def _assert_dynamic_subscription_loop(self):
+        """Dynamic subscription mutations are intentionally single-event-loop only."""
+        loop = asyncio.get_running_loop()
+        if self._loop is None or not self._running:
+            raise RuntimeError('The feed must be started before symbols can be changed')
+        if loop is not self._loop:
+            raise RuntimeError('add_symbols/remove_symbols must run on the feed event loop')
+
+    @staticmethod
+    def _normalized_dynamic_symbols(symbols) -> List[str]:
+        ret = []
+        for symbol in symbols:
+            normalized = symbol.normalized if isinstance(symbol, Symbol) else symbol
+            if normalized not in ret:
+                ret.append(normalized)
+        return ret
+
+    async def _refresh_unknown_symbol_mappings(self, symbols: List[str]):
+        """Fetch current exchange metadata and inject only newly requested symbols."""
+        unknown = [symbol for symbol in symbols if symbol not in self.normalized_symbol_mapping]
+        if not unknown:
+            return
+
+        data = []
+        for endpoint in self.rest_endpoints:
+            address = endpoint.route('instruments', sandbox=self.sandbox)
+            addresses = address if isinstance(address, list) else [address]
+            for address in addresses:
+                LOG.info('%s: refreshing symbol information from %s', self.id, address)
+                response = await self.http_conn.read(address)
+                data.append(json.loads(response) if isinstance(response, (str, bytes)) else response)
+
+        fresh_mapping, fresh_info = type(self)._parse_symbol_data(data if len(data) > 1 else data[0])
+        missing = [symbol for symbol in unknown if symbol not in fresh_mapping]
+        if missing:
+            raise UnsupportedSymbol(f'{", ".join(missing)} is not supported on {self.id}')
+
+        merged_mapping = dict(self.normalized_symbol_mapping)
+        try:
+            _, current_info = Symbols.get(self.id)
+        except KeyError:
+            current_info = {}
+        merged_info = {key: dict(value) if isinstance(value, dict) else value for key, value in current_info.items()}
+
+        for symbol in unknown:
+            merged_mapping[symbol] = fresh_mapping[symbol]
+            for key, values in fresh_info.items():
+                if isinstance(values, dict) and symbol in values:
+                    merged_info.setdefault(key, {})[symbol] = values[symbol]
+
+        # Preserve every startup entry even if a later exchangeInfo response omits it.
+        Symbols.set(self.id, merged_mapping, merged_info)
+        self.normalized_symbol_mapping = merged_mapping
+        self.exchange_symbol_mapping = {value: key for key, value in merged_mapping.items()}
+
+    def _dynamic_stream_specs(self, exchange_symbol: str):
+        """
+        Ask the active ``_address`` override to route every new stream.
+
+        The one-stream call is deliberate: downstream subclasses can change Binance's
+        path rules (for example, routing ``trade`` to ``/public``), and their override
+        remains the single source of truth for both startup and runtime placement.
+        """
+        specs = []
+        original_subscription = self.subscription
+        try:
+            for channel in original_subscription:
+                normalized_channel = self.exchange_channel_to_std(channel)
+                if normalized_channel == OPEN_INTEREST or self.is_authenticated_channel(normalized_channel):
+                    continue
+                if exchange_symbol in original_subscription[channel]:
+                    continue
+
+                self.subscription = {channel: [exchange_symbol]}
+                address = self._address()
+                if isinstance(address, list):
+                    if len(address) != 1:
+                        raise RuntimeError(f'Expected one address for one Binance stream, got {address!r}')
+                    address = address[0]
+                prefix, separator, stream = address.partition('streams=')
+                if not separator or not stream or '/' in stream:
+                    raise RuntimeError(f'Unable to derive Binance stream route from {address!r}')
+                specs.append({'channel': channel, 'exchange_symbol': exchange_symbol, 'stream': stream, 'prefix': prefix})
+        finally:
+            self.subscription = original_subscription
+        return specs
+
+    @staticmethod
+    def _connection_streams(connection) -> List[str]:
+        return list(connection.streams)
+
+    @staticmethod
+    def _set_connection_streams(connection, streams: List[str]):
+        connection.set_streams(streams)
+
+    async def _send_control_message(self, connection, method: str, streams: List[str]):
+        loop = asyncio.get_running_loop()
+        self._control_message_id += 1
+        message_id = self._control_message_id
+        future = loop.create_future()
+        self._pending_control_messages[message_id] = future
+        frame = {'method': method, 'params': streams, 'id': message_id}
+
+        try:
+            async with self._control_message_lock:
+                interval = 1.0 / self.ws_control_message_rate
+                delay = interval - (loop.time() - self._last_control_message)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await connection.write(json.dumps(frame))
+                self._last_control_message = loop.time()
+            await asyncio.wait_for(future, timeout=self._control_ack_timeout)
+        finally:
+            self._pending_control_messages.pop(message_id, None)
+
+    async def control_message_handler(self, message: str, connection: AsyncConnection) -> bool:
+        """Consume Binance command acknowledgements before exchange event dispatch."""
+        if isinstance(message, str) and '"id"' not in message and '"code"' not in message:
+            return False
+        try:
+            payload = json.loads(message)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(payload, dict) or ('result' not in payload and 'code' not in payload):
+            return False
+
+        message_id = payload.get('id')
+        future = self._pending_control_messages.get(message_id)
+        if 'code' in payload:
+            error = RuntimeError(f"{self.id} subscription command failed: {payload.get('code')} {payload.get('msg', '')}".rstrip())
+            LOG.error('%s', error)
+            if future and not future.done():
+                future.set_exception(error)
+            elif message_id is None:
+                for pending in self._pending_control_messages.values():
+                    if not pending.done():
+                        pending.set_exception(error)
+            return True
+
+        if payload.get('result') is None:
+            if future and not future.done():
+                future.set_result(payload)
+            else:
+                LOG.debug('%s: received acknowledgement for unknown command id %s', self.id, message_id)
+            return True
+        return False
+
+    def _spawn_dynamic_connection(self, specs):
+        streams = [spec['stream'] for spec in specs]
+        address = specs[0]['prefix'] + 'streams=' + '/'.join(streams)
+        subscription = defaultdict(list)
+        for spec in specs:
+            subscription[spec['channel']].append(spec['exchange_symbol'])
+        endpoint = self.websocket_endpoints[0]
+        connection = WSAsyncConn(address, self.id, subscription=dict(subscription), **endpoint.options)
+        return self._start_connection(connection, self.subscribe, self.message_handler, self.authenticate, self._loop)
+
+    def _commit_added_symbols(self, normalized_symbols: List[str]):
+        for normalized_symbol in normalized_symbols:
+            exchange_symbol = self.normalized_symbol_mapping[normalized_symbol]
+            for channel, subscribed in self.subscription.items():
+                if exchange_symbol not in subscribed:
+                    if hasattr(subscribed, 'add'):
+                        subscribed.add(exchange_symbol)
+                    else:
+                        subscribed.append(exchange_symbol)
+                standard_channel = self.exchange_channel_to_std(channel)
+                configured = self._feed_config.setdefault(standard_channel, [])
+                if normalized_symbol not in configured:
+                    configured.append(normalized_symbol)
+            if normalized_symbol not in self.normalized_symbols:
+                self.normalized_symbols.append(normalized_symbol)
+
+    def _commit_removed_symbols(self, normalized_symbols: List[str]):
+        for normalized_symbol in normalized_symbols:
+            exchange_symbol = self.normalized_symbol_mapping.get(normalized_symbol)
+            if exchange_symbol is None:
+                continue
+            for channel, subscribed in self.subscription.items():
+                while exchange_symbol in subscribed:
+                    subscribed.remove(exchange_symbol)
+                standard_channel = self.exchange_channel_to_std(channel)
+                configured = self._feed_config.get(standard_channel, [])
+                while normalized_symbol in configured:
+                    configured.remove(normalized_symbol)
+            while normalized_symbol in self.normalized_symbols:
+                self.normalized_symbols.remove(normalized_symbol)
+
+    def _sync_open_interest_poll_addresses(self):
+        """Keep Binance Futures' REST-polled open-interest channel in lockstep."""
+        channel = self.websocket_channels.get(OPEN_INTEREST)
+        if channel not in self.subscription:
+            return
+        addresses = [self.rest_endpoints[0].route('open_interest', sandbox=self.sandbox).format(symbol)
+                     for symbol in self.subscription[channel]]
+        for handler in self.connection_handlers:
+            if isinstance(handler.conn, HTTPPoll):
+                handler.conn.address = addresses
+
+    def _clear_symbol_state(self, normalized_symbol: str, exchange_symbol: str):
+        """Discard state so a later L2 diff follows the normal snapshot bootstrap."""
+        self._l2_book.pop(normalized_symbol, None)
+        self._l3_book.pop(normalized_symbol, None)
+        self.last_update_id.pop(normalized_symbol, None)
+        self.previous_book.pop(normalized_symbol, None)
+        self._sequence_no.pop(normalized_symbol, None)
+        self._open_interest_cache.pop(exchange_symbol, None)
+        self._open_interest_cache.pop(normalized_symbol, None)
+
+    async def add_symbols(self, symbols):
+        """
+        Subscribe symbols on a running Binance feed using its existing channels.
+
+        This coroutine must be called on the event loop that started the feed.
+        """
+        self._assert_dynamic_subscription_loop()
+        if self.requires_authentication:
+            raise NotImplementedError('Runtime symbol changes are only supported for public Binance feeds')
+        normalized_symbols = self._normalized_dynamic_symbols(symbols)
+
+        async with self._dynamic_subscription_lock:
+            await self._refresh_unknown_symbol_mappings(normalized_symbols)
+            specs = []
+            for normalized_symbol in normalized_symbols:
+                exchange_symbol = self.normalized_symbol_mapping[normalized_symbol]
+                symbol_specs = self._dynamic_stream_specs(exchange_symbol)
+                if symbol_specs:
+                    self._clear_symbol_state(normalized_symbol, exchange_symbol)
+                    specs.extend(symbol_specs)
+            if not specs:
+                self._commit_added_symbols(normalized_symbols)
+                self._sync_open_interest_poll_addresses()
+                return
+
+            capacity = self.per_connection_limit - self.subscription_headroom
+            live_connections = [handler.conn for handler in self.connection_handlers if isinstance(handler.conn, WSAsyncConn) and handler.conn.is_open]
+            assignments = defaultdict(list)
+            counts = {connection: len(self._connection_streams(connection)) for connection in live_connections}
+            unplaced = defaultdict(list)
+
+            for spec in specs:
+                candidates = [connection for connection in live_connections
+                              if connection.stream_address_prefix == spec['prefix'] and counts[connection] < capacity]
+                if candidates:
+                    connection = min(candidates, key=lambda item: counts[item])
+                    assignments[connection].append(spec)
+                    counts[connection] += 1
+                else:
+                    unplaced[spec['prefix']].append(spec)
+
+            successful = []
+            try:
+                for connection, assigned in assignments.items():
+                    streams = [spec['stream'] for spec in assigned]
+                    await self._send_control_message(connection, 'SUBSCRIBE', streams)
+                    successful.append((connection, streams))
+            except Exception:
+                for connection, streams in successful:
+                    try:
+                        await self._send_control_message(connection, 'UNSUBSCRIBE', streams)
+                    except Exception:
+                        LOG.error('%s: failed to roll back a partial runtime subscription', self.id, exc_info=True)
+                raise
+
+            for connection, streams in successful:
+                self._set_connection_streams(connection, self._connection_streams(connection) + streams)
+
+            for pending in unplaced.values():
+                for offset in range(0, len(pending), capacity):
+                    self._spawn_dynamic_connection(pending[offset:offset + capacity])
+
+            self._commit_added_symbols(normalized_symbols)
+            self._sync_open_interest_poll_addresses()
+
+    async def remove_symbols(self, symbols):
+        """
+        Unsubscribe symbols and clear their local state on a running Binance feed.
+
+        This coroutine must be called on the event loop that started the feed.
+        Empty connections deliberately remain under their existing handler lifecycle.
+        """
+        self._assert_dynamic_subscription_loop()
+        normalized_symbols = self._normalized_dynamic_symbols(symbols)
+
+        async with self._dynamic_subscription_lock:
+            requested_streams = set()
+            exchange_symbols = {}
+            for normalized_symbol in normalized_symbols:
+                exchange_symbol = self.normalized_symbol_mapping.get(normalized_symbol)
+                if exchange_symbol is None:
+                    continue
+                exchange_symbols[normalized_symbol] = exchange_symbol
+                original_subscription = self.subscription
+                try:
+                    # Build the same stream names while they are still in the registry.
+                    for channel in original_subscription:
+                        normalized_channel = self.exchange_channel_to_std(channel)
+                        if normalized_channel == OPEN_INTEREST or self.is_authenticated_channel(normalized_channel):
+                            continue
+                        self.subscription = {channel: []}
+                        self.subscription[channel] = [exchange_symbol]
+                        address = self._address()
+                        if isinstance(address, list):
+                            address = address[0]
+                        _, separator, stream = address.partition('streams=')
+                        if separator and stream:
+                            requested_streams.add(stream)
+                finally:
+                    self.subscription = original_subscription
+
+            removals = []
+            for handler in self.connection_handlers:
+                connection = handler.conn
+                if not isinstance(connection, WSAsyncConn):
+                    continue
+                present = [stream for stream in self._connection_streams(connection) if stream in requested_streams]
+                if not present:
+                    continue
+                removals.append((connection, present))
+
+            successful = []
+            try:
+                for connection, present in removals:
+                    if connection.is_open:
+                        await self._send_control_message(connection, 'UNSUBSCRIBE', present)
+                        successful.append((connection, present))
+            except Exception:
+                for connection, present in successful:
+                    try:
+                        await self._send_control_message(connection, 'SUBSCRIBE', present)
+                    except Exception:
+                        LOG.error('%s: failed to roll back a partial runtime unsubscription', self.id, exc_info=True)
+                raise
+
+            for connection, present in removals:
+                remaining = [stream for stream in self._connection_streams(connection) if stream not in requested_streams]
+                self._set_connection_streams(connection, remaining)
+
+            self._commit_removed_symbols(normalized_symbols)
+            self._sync_open_interest_poll_addresses()
+            for normalized_symbol, exchange_symbol in exchange_symbols.items():
+                self._clear_symbol_state(normalized_symbol, exchange_symbol)
 
     def _reset(self):
         self._l2_book = {}
@@ -531,12 +888,23 @@ class Binance(Feed, BinanceRestMixin):
             LOG.warning("%s: Unexpected message received: %s", self.id, msg)
 
     async def subscribe(self, conn: AsyncConnection):
-        # Binance does not have a separate subscribe message, the
-        # subscription information is included in the
-        # connection endpoint
+        # Runtime changes are persisted in the URL stream registry, so reconnects
+        # bootstrap directly from the durable address without replaying control frames.
         if isinstance(conn, (HTTPPoll, HTTPConcurrentPoll)):
             self._open_interest_cache = {}
         else:
-            self._reset()
+            streams = getattr(conn, 'streams', None)
+            if streams is None:
+                # Raw playback and third-party connection shims predate the durable
+                # stream registry, so preserve their historical reset behavior.
+                self._reset()
+            else:
+                for stream in streams:
+                    exchange_symbol, _, channel = stream.partition('@')
+                    if channel.startswith('depth'):
+                        exchange_symbol = exchange_symbol.upper()
+                        normalized_symbol = self.exchange_symbol_mapping.get(exchange_symbol)
+                        if normalized_symbol:
+                            self._clear_symbol_state(normalized_symbol, exchange_symbol)
         if self.requires_authentication:
             create_task(self._refresh_token())
