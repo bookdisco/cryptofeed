@@ -85,3 +85,6 @@ cryptofeed = ["*.pyx"]
 language_level = 3
 annotate = false
 compiler_directives = {optimize.use_switch = true, optimize.unpack_method_calls = true}
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
